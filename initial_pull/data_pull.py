@@ -6,13 +6,29 @@ from datetime import datetime
 from typing import List, Dict
 
 from selenium import webdriver
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+class Rarity(Enum):
+    COMMON = "COMMON"
+    UNCOMMON = "UNCOMMON"
+    RARE = "RARE"
+    MYTHIC = "MYTHIC"
+    SPECIAL = "SPECIAL"
+    UNKNOWN = "UNKNOWN"
+
+    @classmethod
+    def from_string(cls, value: str):
+        normalized_value = value.strip().upper()
+        for rarity in cls:
+            if rarity.value == normalized_value:
+                return rarity
+        return cls.UNKNOWN
 
 
 class DeckFormat(Enum):
@@ -36,6 +52,22 @@ class DeckFormat(Enum):
 
 
 @dataclass
+class Card:
+    unique_id: str
+    scryfall_id: str
+    name: str
+    cmc: int
+    type_line: str
+    colors: List[str]
+    rarity: "Rarity" = "Rarity.UNKNOWN"
+    max_quantity: int = 0
+
+
+@dataclass
+class CollectionWildcardTally:
+    cards: Dict[str, Card] = field(default_factory=dict)
+
+@dataclass
 class DeckWildcardTally:
     deck_name: str
     url: str
@@ -43,7 +75,7 @@ class DeckWildcardTally:
     last_updated_at: datetime.date
     common: int = 0
     uncommon: int = 0
-    rarity: int = 0
+    rare: int = 0
     mythic: int = 0
     special: int = 0
 
@@ -59,8 +91,11 @@ class DeckDataFetcher:
         If driver_path is not provided, the default ChromeDriver from PATH will be used.
         """
         self.author_user_name = "CovertGoBlue"
-        self.driver_chunk_size = 100
+        self.driver_chunk_size = 200
+        self.max_workers = 1
         self.driver_path = driver_path
+        self.standard_wildcard_tally = CollectionWildcardTally(cards={})
+        self.historic_brawl_wildcard_tally = CollectionWildcardTally(cards={})
 
     def _build_page_url(self, page_number: int, page_size: int = 50) -> str:
         """
@@ -176,6 +211,7 @@ class DeckDataFetcher:
         all_cards = mainboard_cards + sideboard_cards
 
         for card_entry in all_cards:
+            self.add_card_to_collection(card_entry, deck_format)
             card_info = card_entry.get("card", {})
             rarity_str = card_info.get("rarity", "").lower()
             quantity = card_entry.get("quantity", 1)
@@ -185,7 +221,7 @@ class DeckDataFetcher:
             elif rarity_str == "uncommon":
                 tally.uncommon += quantity
             elif rarity_str == "rare":
-                tally.rarity += quantity
+                tally.rare += quantity
             elif rarity_str == "mythic":
                 tally.mythic += quantity
             elif rarity_str == "special":
@@ -198,17 +234,49 @@ class DeckDataFetcher:
 
         return tally
 
-    def run_for_url(self, url: str) -> DeckWildcardTally:
-        logger.info(f"Running deck analysis for URL: {url}")
-        data_dict = self.fetch_and_extract_data(url)
+    def add_card_to_collection(self, card_data: dict, deck_format: DeckFormat):
+        """
+        Adds a card to the collection_wildcard_tally attribute based on the card data dictionary.
 
-        if data_dict:
-            tally = self.process_data_to_DeckWildcardTally(data_dict)
-            logger.info(f"Processed Tally: {tally}")
-            return tally
-        else:
-            logger.info("No data extracted.")
-            return None
+        :param card_data: The dictionary containing card details.
+        """
+        card = card_data["card"]
+
+        unique_id = card["uniqueCardId"]
+        scryfall_id = card["scryfall_id"]
+        name = card["name"]
+        cmc = int(card["cmc"])
+        type_line = card["type_line"]
+        colors = card.get("colors", [])
+        rarity = Rarity.from_string(card.get("rarity", "UNKNOWN"))
+        max_quantity = card_data.get("quantity", 0)
+
+        # Create a Card object
+        new_card = Card(
+            unique_id=unique_id,
+            scryfall_id=scryfall_id,
+            name=name,
+            cmc=cmc,
+            type_line=type_line,
+            colors=colors,
+            rarity=rarity,
+            max_quantity=max_quantity,
+        )
+
+        if deck_format == DeckFormat.BRAWL:
+
+            if unique_id in self.historic_brawl_wildcard_tally.cards:
+                if self.historic_brawl_wildcard_tally.cards[unique_id].max_quantity < max_quantity:
+                    self.historic_brawl_wildcard_tally.cards[unique_id].max_quantity = max_quantity
+            else:
+                self.historic_brawl_wildcard_tally.cards[unique_id] = new_card
+        elif deck_format == DeckFormat.STANDARD:
+            if unique_id in self.standard_wildcard_tally.cards:
+                if self.standard_wildcard_tally.cards[unique_id].max_quantity < max_quantity:
+                    self.standard_wildcard_tally.cards[unique_id].max_quantity = max_quantity
+            else:
+                self.standard_wildcard_tally.cards[unique_id] = new_card
+        logger.debug(f"Added card {name} (ID: {unique_id}) to {DeckFormat} collection with max_quantity: {max_quantity}")
 
     def scan_decklists_from_profile(self, start_page=1, end_page=5):
         """
@@ -237,7 +305,7 @@ class DeckDataFetcher:
 
         # 3) Use ThreadPoolExecutor to pull data for groups of URLs simultaneously
         decklists = []
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_chunk = {
                 executor.submit(self.fetch_and_extract_data, chunk): chunk
                 for chunk in url_chunks
@@ -293,7 +361,7 @@ class DeckDataFetcher:
         logger.info(f"Created {len(url_chunks)} chunk(s) of URLs (up to 10 per chunk).")
 
         # 4) Fetch data in parallel, one chunk per thread
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # Here we assume `self.fetch_and_extract_data` now accepts a list of URLs
             # and returns a dict { url: extracted_data_dict }
             future_to_chunk = {
@@ -321,7 +389,7 @@ class DeckDataFetcher:
         return deck_tallies
 
     @staticmethod
-    def export_to_csv(deck_tallies: List[DeckWildcardTally], output_file: str):
+    def export_decklists_to_csv(deck_tallies: List[DeckWildcardTally], output_file: str):
         """
         Exports a list of DeckWildcardTally objects to a CSV file.
 
@@ -344,6 +412,32 @@ class DeckDataFetcher:
         except Exception as e:
             logger.error(f"An error occurred while writing to CSV: {e}")
 
+    @staticmethod
+    def export_cards_to_csv(collection: CollectionWildcardTally, output_file: str):
+        """
+        Exports the cards from the CollectionWildcardTally to a CSV file.
+
+        :param collection: The CollectionWildcardTally object containing the cards.
+        :param output_file: Path to the output CSV file.
+        """
+        logger.info(f"Exporting card collection to CSV: {output_file}")
+        fieldnames = ['max_quantity', 'name',] + [field for field in Card.__dataclass_fields__.keys() if
+                                          field not in ['max_quantity', 'name']]
+
+        try:
+            with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+
+                for card in collection.cards.values():
+                    card_data = asdict(card)
+                    writer.writerow(card_data)
+
+            logger.info(f"Card collection successfully written to {output_file}")
+
+        except Exception as e:
+            logger.error(f"An error occurred while writing to CSV: {e}")
+
 
 def main():
     """
@@ -353,7 +447,9 @@ def main():
     all_deck_data = fetcher.scan_decklists_from_profile(start_page=1, end_page=23)
     logger.info(f"Collected {len(all_deck_data)} deck(s) from pages 1-5.")
     rarity_data = fetcher.retrieve_and_process_deck_data(all_deck_data)
-    fetcher.export_to_csv(rarity_data, "data.csv")
+    fetcher.export_decklists_to_csv(rarity_data, "deck_data.csv")
+    fetcher.export_cards_to_csv(fetcher.historic_brawl_wildcard_tally, "brawl_card_data.csv")
+    fetcher.export_cards_to_csv(fetcher.standard_wildcard_tally, "standard_card_data.csv")
 
 
 if __name__ == "__main__":
